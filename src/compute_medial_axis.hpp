@@ -67,19 +67,14 @@ compute_single_ma_point(
         c = p - r * n;
 
         // Nearest point q in cloud to current center
-        std::vector<size_t> indices(2);
-        std::vector<double> dists(2);
-        nanoflann::KNNResultSet<double> resultSet(2);
+        std::vector<size_t> indices(1);
+        std::vector<double> dists(1);
+        nanoflann::KNNResultSet<double> resultSet(1);
         resultSet.init(&indices[0], &dists[0]);
         kd_tree.index->findNeighbors(resultSet, &c[0], nanoflann::SearchParams(10));
 
         qidx = indices[0];
-        if (qidx== i) {
-            q = points.row(indices[1]).transpose();
-            Eigen::VectorXd vqp = p - q;
-            if (cos_angle(vqp, n) > 0.0) qidx = indices[1];
-            else return {Eigen::VectorXd::Zero(p.size()), -1.0};
-        }
+        if (qidx== i) break;
 
         Eigen::VectorXd q = points.row(qidx).transpose();
         double r_nxt = compute_radius(p, n, q);
