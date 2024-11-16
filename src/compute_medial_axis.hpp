@@ -36,7 +36,7 @@ typedef nanoflann::KDTreeEigenMatrixAdaptor<Eigen::MatrixXd> KDTree;
 
 double compute_radius(const Eigen::VectorXd& p, const Eigen::VectorXd& n, const Eigen::VectorXd& q) {
     double d = (p - q).norm();
-    double cos_theta = n.dot(p - q) / d;
+    double cos_theta = abs(n.dot(p - q) / d);
     return d / (2 * cos_theta);
 }
 
@@ -51,16 +51,10 @@ std::pair<Eigen::VectorXd, double>
 compute_single_ma_point(
     int i, const Eigen::VectorXd& p, const Eigen::VectorXd& n,
     const Eigen::MatrixXd& points, KDTree& kd_tree,
-    int max_iters, double eps
+    double init_r, int max_iters, double eps
 ) {
-    std::random_device rd;
-    std::mt19937 gen(rd());
-    std::uniform_int_distribution<> distrib(0, points.rows() - 1);
-    int qidx;
-    do { qidx = distrib(gen); } while (qidx == i);
-    Eigen::VectorXd q = points.row(qidx).transpose();
-    double r = compute_radius(p, n, q);
-
+    int qidx = -1;
+    double r = init_r;
     unsigned int j = 0;
     Eigen::VectorXd c;
     while (j < max_iters) {
@@ -76,12 +70,13 @@ compute_single_ma_point(
         qidx = indices[0];
         if (qidx== i) break;
 
+        ++j;
+
         Eigen::VectorXd q = points.row(qidx).transpose();
         double r_nxt = compute_radius(p, n, q);
         if (abs(r - r_nxt) < eps) break;
 
         r = r_nxt;
-        ++j;
     }
 
     if (j > 0) return {c, r};
@@ -126,6 +121,11 @@ void compute_medial_axis(
     assert(points.cols() == normals.cols());
     assert((points.cols() == 2) || (points.cols() == 3));
 
+    // Approximate the maximum distance in point cloud
+    Eigen::VectorXd minValues = points.colwise().minCoeff();
+    Eigen::VectorXd maxValues = points.colwise().maxCoeff();
+    double init_r = std::sqrt((maxValues - minValues).squaredNorm());
+
     // Build KD-tree for KNN
     KDTree kd_tree(points.cols(), points, 10);
     kd_tree.index->buildIndex();
@@ -137,7 +137,7 @@ void compute_medial_axis(
     for (size_t i = 0; i < points.rows(); ++i) {
         Eigen::VectorXd p = points.row(i).transpose();
         Eigen::VectorXd n = normals.row(i).transpose();
-        auto result = compute_single_ma_point(i, p, n, points, kd_tree, max_iters, eps);
+        auto result = compute_single_ma_point(i, p, n, points, kd_tree, init_r, max_iters, eps);
         ball_centers.row(i) = result.first;
         ball_radii(i) = result.second;
     }
