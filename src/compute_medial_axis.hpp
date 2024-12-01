@@ -36,7 +36,7 @@ typedef nanoflann::KDTreeEigenMatrixAdaptor<Eigen::MatrixXd> KDTree;
 
 double compute_radius(const Eigen::VectorXd& p, const Eigen::VectorXd& n, const Eigen::VectorXd& q) {
     double d = (p - q).norm();
-    double cos_theta = abs(n.dot(p - q) / d);
+    double cos_theta = n.dot(p - q) / d;
     return d / (2 * cos_theta);
 }
 
@@ -49,38 +49,65 @@ double cos_angle(const Eigen::VectorXd& p, const Eigen::VectorXd& q) {
 
 std::pair<Eigen::VectorXd, double>
 compute_single_ma_point(
-    int i, const Eigen::VectorXd& p, const Eigen::VectorXd& n,
-    const Eigen::MatrixXd& points, KDTree& kd_tree,
-    double init_r, int max_iters, double eps
+    const Eigen::MatrixXd& points, const Eigen::MatrixXd& normals,
+    KDTree& kd_tree, int i,
+    double init_r, double neib_dist,
+    int max_iters, double eps, double ndot_thd
 ) {
-    int qidx = -1;
+    Eigen::VectorXd p = points.row(i).transpose();
+    Eigen::VectorXd n = normals.row(i).transpose();
+
     double r = init_r;
     unsigned int j = 0;
-    Eigen::VectorXd c;
-    while (j < max_iters) {
-        c = p - r * n;
+    Eigen::VectorXd c = p - r * n;
+    Eigen::VectorXd q = p;
+    int qidx = -1;
 
-        // Nearest point q in cloud to current center
-        std::vector<size_t> indices(1);
-        std::vector<double> dists(1);
-        nanoflann::KNNResultSet<double> resultSet(1);
+    while (j < max_iters) {
+
+        // Nearest points to c
+        const int k = 10;
+        std::vector<size_t> indices(k);
+        std::vector<double> dists(k);
+        nanoflann::KNNResultSet<double> resultSet(k);
         resultSet.init(&indices[0], &dists[0]);
         kd_tree.index->findNeighbors(resultSet, &c[0], nanoflann::SearchParams(10));
 
-        qidx = indices[0];
-        if (qidx== i) break;
+        // Do not shrink
+        if (abs(dists[0]-r) < eps) break;
 
-        ++j;
+        // Find a suitable q
+        double min_ndot = ndot_thd;
+        double max_dist_pq = 0;
+        qidx = -1;
+        for (size_t z = 0; z < k; ++z) {
+            size_t idx = indices[z];
+            if (idx == i) continue;
+            double dist_pq = (p - points.row(idx).transpose()).norm();
+            double dist_q = dists[z];
+            if (dist_q - dists[0] > eps) continue;
+            Eigen::VectorXd qn = normals.row(idx); double ndot = n.dot(qn);
+            if ((ndot < min_ndot) || (dist_pq > k * k * neib_dist)) {
+                if (dist_pq > max_dist_pq) {
+                    max_dist_pq = dist_pq;
+                    min_ndot = ndot;
+                    qidx = idx;
+                }
+            }
+        }
+        if (qidx == -1) break;
 
-        Eigen::VectorXd q = points.row(qidx).transpose();
+        q = points.row(qidx).transpose();
         double r_nxt = compute_radius(p, n, q);
         if (abs(r - r_nxt) < eps) break;
 
         r = r_nxt;
+        c = p - r * n;
+        ++j;
     }
 
     if (j > 0) return {c, r};
-    return {Eigen::VectorXd::Zero(p.size()), -1.0};
+    return {c, -1.0};
 }
 
 double expected_radius(
@@ -106,6 +133,29 @@ double expected_radius(
     return max_radius;
 }
 
+void remove_invalid_points(
+    Eigen::MatrixXd& ma_points,
+    Eigen::VectorXd& ma_radii
+) {
+    size_t dim = ma_points.cols();
+    std::vector<Eigen::VectorXd> points;
+    std::vector<double> radii;
+    // Store only valid points and radii (whose radius is not negative)
+    for (size_t i = 0; i < ma_points.rows(); ++i) {
+        if (ma_radii(i) < 0.0) continue;
+        points.push_back(ma_points.row(i).transpose());
+        radii.push_back(ma_radii(i));
+    }
+    // Convert back to Eigen Matrices
+    ma_points.resize(points.size(), dim); ma_points.setZero();
+    ma_radii.resize(radii.size()); ma_radii.setZero();
+    #pragma omp parallel for
+    for (size_t i = 0; i < points.size(); ++i) {
+        ma_points.row(i) = points[i].transpose();
+        ma_radii(i) = radii[i];
+    }
+}
+
 
 void compute_medial_axis(
     Eigen::MatrixXd& ma_points,
@@ -113,13 +163,20 @@ void compute_medial_axis(
     const Eigen::MatrixXd& points,
     const Eigen::MatrixXd& normals,
     int max_iters=30,
-    double eps=1e-8,
+    double eps=1e-4,
+    double ndot_thd=0.99,
     double denoise_k=6,
-    double denoise_alpha=0.7
+    double denoise_alpha=0.7 
 ) {
     assert(points.rows() == normals.rows());
     assert(points.cols() == normals.cols());
     assert((points.cols() == 2) || (points.cols() == 3));
+
+    Eigen::MatrixXd _normals(normals);
+    // Make sure each normal vector is normalized
+    for (int i = 0; i < _normals.rows(); ++i) {
+        _normals.row(i).normalize();
+    }
 
     // Approximate the maximum distance in point cloud
     Eigen::VectorXd minValues = points.colwise().minCoeff();
@@ -130,55 +187,47 @@ void compute_medial_axis(
     KDTree kd_tree(points.cols(), points, 10);
     kd_tree.index->buildIndex();
 
+    // Approximate the distance from one point to its neighbour
+    //  assuming a uniform sampling
+    std::vector<size_t> indices(2);
+    std::vector<double> dists(2);
+    nanoflann::KNNResultSet<double> resultSet(2);
+    resultSet.init(&indices[0], &dists[0]);
+    Eigen::VectorXd p0 = points.row(0).transpose();
+    kd_tree.index->findNeighbors(resultSet, &p0[0], nanoflann::SearchParams(10));
+    Eigen::VectorXd q0 = points.row(indices[1]).transpose();
+    double neib_dist = (p0 - q0).norm();
+
     // Process each point
-    Eigen::MatrixXd ball_centers(points.rows(), points.cols());
-    Eigen::VectorXd ball_radii(points.rows());
+    ma_points.resize(points.rows(), points.cols()); ma_points.setZero();
+    ma_radii.resize(points.rows()); ma_radii.setZero();
     #pragma omp parallel for
     for (size_t i = 0; i < points.rows(); ++i) {
         Eigen::VectorXd p = points.row(i).transpose();
-        Eigen::VectorXd n = normals.row(i).transpose();
-        auto result = compute_single_ma_point(i, p, n, points, kd_tree, init_r, max_iters, eps);
-        ball_centers.row(i) = result.first;
-        ball_radii(i) = result.second;
+        Eigen::VectorXd n = _normals.row(i).transpose();
+        auto [c, r] = compute_single_ma_point(
+            points, _normals,
+            kd_tree, i,
+            init_r, neib_dist,
+            max_iters, eps, ndot_thd
+        );
+        ma_points.row(i) = c;
+        ma_radii(i) = r;
     }
-
-    // Denoise and remove all inf points
-    std::vector<Eigen::VectorXd> centers;
-    std::vector<double> radii;
-    #pragma omp parallel
-    {
-        std::vector<Eigen::Vector3d> local_centers;
-        std::vector<double> local_radii;
-
-        #pragma omp for nowait
-        for (size_t i = 0; i < ball_centers.rows(); ++i) {
-            double rp = ball_radii[i];
-            if (rp > 0.0) {
-                Eigen::VectorXd p = points.row(i).transpose();
-                Eigen::VectorXd cp = ball_centers.row(i).transpose();
-                double rho = expected_radius(p, points, kd_tree, cp, ball_centers, denoise_k, denoise_alpha);
-                if (rp >= rho) {
-                    local_centers.push_back(cp);
-                    local_radii.push_back(rp);
-                }
-            }
-        }
-
-        #pragma omp critical
-        {
-            centers.insert(centers.end(), local_centers.begin(), local_centers.end());
-            radii.insert(radii.end(), local_radii.begin(), local_radii.end());
-        }
-    }
-
-    // Convert back to Eigen Matrices
-    ma_points.resize(centers.size(), points.cols()); ma_points.setZero();
-    ma_radii.resize(centers.size()); ma_radii.setZero();
+    // Denoising
     #pragma omp parallel for
-    for (size_t i = 0; i < centers.size(); ++i) {
-        ma_points.row(i) = centers[i];
-        ma_radii(i) = radii[i];
+    for (size_t i = 0; i < points.rows(); ++i) {
+        double r = ma_radii(i);
+        if (r < 0.0) continue;
+        Eigen::VectorXd cp = ma_points.row(i).transpose();
+        Eigen::VectorXd p = points.row(i).transpose();
+        double rho = expected_radius(p, points, kd_tree, cp, ma_points, denoise_k, denoise_alpha);
+        if (r < rho) {
+            ma_radii(i) = -1.0;
+        }
     }
+    remove_invalid_points(ma_points, ma_radii);
 }
+
 
 #endif  // MASB_COMPUTE_MEDIAL_AXIS
